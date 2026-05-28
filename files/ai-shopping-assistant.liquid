@@ -232,6 +232,34 @@
   #ai-chat-send:hover  { background: #333; }
   #ai-chat-send:disabled { background: #ccc; cursor: default; }
 
+  /* ── Order confirmation card ── */
+  .ai-order-confirmed {
+    background: #f0fdf4;
+    border: 1.5px solid #86efac;
+    border-radius: 12px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 100%;
+  }
+  .ai-order-confirmed__icon { font-size: 20px; }
+  .ai-order-confirmed__title {
+    font-weight: 700;
+    font-size: 14px;
+    color: #15803d;
+  }
+  .ai-order-confirmed__number {
+    font-size: 13px;
+    color: #166534;
+  }
+  .ai-order-confirmed__note {
+    font-size: 11px;
+    color: #4ade80;
+    margin-top: 2px;
+    color: #16a34a;
+  }
+
   /* ── Product cards ── */
   .ai-product-grid {
     display: grid;
@@ -351,6 +379,32 @@
     return div;
   }
 
+  // ── Render order confirmation card ───────────────────────────────────────
+  function appendOrderConfirmed(orderNumber, orderName) {
+    const card = document.createElement('div');
+    card.className = 'ai-order-confirmed';
+
+    const icon = document.createElement('div');
+    icon.className = 'ai-order-confirmed__icon';
+    icon.textContent = '✅';
+
+    const title = document.createElement('div');
+    title.className = 'ai-order-confirmed__title';
+    title.textContent = 'Order confirmed!';
+
+    const num = document.createElement('div');
+    num.className = 'ai-order-confirmed__number';
+    num.textContent = 'Order ' + (orderName || '#' + orderNumber);
+
+    const note = document.createElement('div');
+    note.className = 'ai-order-confirmed__note';
+    note.textContent = 'Payment collected on delivery — no card needed.';
+
+    card.append(icon, title, num, note);
+    messages.appendChild(card);
+    messages.scrollTop = messages.scrollHeight;
+  }
+
   // ── Render product image cards ────────────────────────────────────────────
   function appendProductCards(products) {
     if (!products || !products.length) return;
@@ -450,6 +504,9 @@
           } else if (event.type === 'products') {
             typing.style.display = 'none';
             appendProductCards(event.products);
+          } else if (event.type === 'order_confirmed') {
+            typing.style.display = 'none';
+            appendOrderConfirmed(event.order_number, event.order_name);
           } else if (event.type === 'tool') {
             // Keep typing indicator visible while tool runs
             typing.style.display = 'flex';

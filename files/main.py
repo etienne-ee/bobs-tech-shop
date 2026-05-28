@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 import anthropic
+import httpx
 from dotenv import load_dotenv, set_key
 from fastapi import FastAPI, HTTPException, Form, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +21,7 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN")  # e.g. my-store.myshopify.com
+SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN")    # Admin API token for creating orders
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -47,13 +49,10 @@ SYSTEM_PROMPT = f"""You are a friendly and knowledgeable shopping assistant for 
 Your job is to help customers:
 - Search and discover products using natural language
 - Understand product details, pricing, and availability
-- Add items to their cart
+- Add items to their cart and place orders
 - Answer questions about store policies, shipping, and returns
-- Guide them smoothly through to checkout
 
-Always be concise and helpful.
-When a customer adds something to their cart, confirm it and suggest checkout or related items.
-Store domain: {SHOPIFY_STORE_DOMAIN}
+Always be concise and helpful. Store domain: {SHOPIFY_STORE_DOMAIN}
 
 ## Search strategy
 
@@ -61,14 +60,13 @@ Always call search_catalog with pagination.limit set to 25 or less — never omi
 
 Use this two-step approach:
 1. Search with the customer's specific keywords first (e.g. "charger", "sleeve", "sock").
-2. If that returns 0 products, do a fallback search using the query "tech" with limit 25 — this reliably returns the full catalog for this store. Then filter the results by hand to find the best match for what the customer asked for.
+2. If that returns 0 products, do a fallback search using the query "tech" with limit 25 — this reliably returns the full catalog for this store. Then filter the results by hand to find the best match.
 
 Never tell a customer a product doesn't exist based on a single failed search. Always try the fallback before concluding something is out of stock.
 
 ## Product cards
 
-IMPORTANT — whenever you list one or more products, append a JSON block at the very end of your
-message in exactly this format (nothing after the closing fence):
+Whenever you list one or more products, append a JSON block at the very end of your message in exactly this format (nothing after the closing fence):
 
 ```products
 [
@@ -82,11 +80,56 @@ message in exactly this format (nothing after the closing fence):
 ```
 
 Rules:
-- Use the exact image URL from the Shopify product data (get_product_details has it).
-- Use the exact product URL from the Shopify product data.
+- Use the exact image URL and product URL from the Shopify product data.
 - Include every product you mention in the block.
 - If a product has no image, omit the image_url field.
 - Never fabricate URLs or prices.
+
+## Cart and checkout
+
+When you show a customer a product, note its variant ID from the Shopify product data.
+Variant IDs look like: "gid://shopify/ProductVariant/44242430951475"
+
+Keep a mental note of the customer's cart — what they've asked to add, each item's variant ID, and quantity.
+
+When a customer wants to checkout, collect their details in exactly two friendly messages — not one field at a time:
+
+**Message 1** — ask for name and email together in a warm, natural way. Example:
+"Sounds great! To get your order on its way, what's your name and email address?"
+
+**Message 2** — once you have those, ask for phone and full delivery address together. Example:
+"Perfect! And what's the best number to reach you on, and where should we deliver? (Street address, city, and postal code)"
+
+Once you have all four pieces of info, give a warm summary — list the items, total, and delivery address — and let them know payment is Cash on Delivery (collected at the door, no card needed). Then ask them to confirm.
+
+When the customer confirms, output this block at the very end of your message and nothing after it:
+
+```order
+{{
+  "customer": {{
+    "first_name": "...",
+    "last_name": "...",
+    "email": "...",
+    "phone": "..."
+  }},
+  "shipping_address": {{
+    "address1": "...",
+    "city": "...",
+    "zip": "...",
+    "country_code": "ZA"
+  }},
+  "line_items": [
+    {{"variant_id": "gid://shopify/ProductVariant/...", "title": "...", "quantity": 1}}
+  ]
+}}
+```
+
+Rules:
+- Use real variant IDs from the Shopify product data — never invent them.
+- country_code is always "ZA" for this store.
+- Only output the order block once the customer has explicitly confirmed.
+- Never ask for payment details — it is always Cash on Delivery.
+- Keep the tone friendly and conversational throughout — this should feel like chatting with a helpful person, not filling in a form.
 """
 
 # ── Lifespan: create agent + environment once on startup ──────────────────────
@@ -267,13 +310,32 @@ async def chat(session_id: str, body: ChatRequest):
                     text = getattr(block, "text", None)
                     if not text:
                         continue
-                    match = re.search(r"```products\s*(\[.*?\])\s*```", text, re.DOTALL)
-                    if match:
-                        clean_text = text[:match.start()].rstrip()
+
+                    # Order block — create the Shopify order and emit confirmation
+                    order_match = re.search(r"```order\s*(\{.*?\})\s*```", text, re.DOTALL)
+                    if order_match:
+                        clean_text = text[:order_match.start()].rstrip()
                         if clean_text:
                             yield f"data: {json.dumps({'type': 'text', 'content': clean_text})}\n\n"
                         try:
-                            products = json.loads(match.group(1))
+                            order_data = json.loads(order_match.group(1))
+                            result = await loop.run_in_executor(
+                                executor, lambda: _create_shopify_order(order_data)
+                            )
+                            order = result.get("order", {})
+                            yield f"data: {json.dumps({'type': 'order_confirmed', 'order_number': order.get('order_number'), 'order_name': order.get('name')})}\n\n"
+                        except Exception as exc:
+                            yield f"data: {json.dumps({'type': 'error', 'message': f'Could not place order: {exc}'})}\n\n"
+                        continue
+
+                    # Products block — emit product cards
+                    prod_match = re.search(r"```products\s*(\[.*?\])\s*```", text, re.DOTALL)
+                    if prod_match:
+                        clean_text = text[:prod_match.start()].rstrip()
+                        if clean_text:
+                            yield f"data: {json.dumps({'type': 'text', 'content': clean_text})}\n\n"
+                        try:
+                            products = json.loads(prod_match.group(1))
                             yield f"data: {json.dumps({'type': 'products', 'products': products})}\n\n"
                         except json.JSONDecodeError:
                             pass
@@ -297,13 +359,61 @@ async def chat(session_id: str, body: ChatRequest):
     )
 
 
-def _send_whatsapp_reply(to: str, reply_text: str) -> None:
+def _create_shopify_order(order_data: dict) -> dict:
+    """Create a Shopify order via the Admin API with Cash on Delivery payment."""
+    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json"
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+        "Content-Type": "application/json",
+    }
+
+    # Strip GID prefix — Admin API needs plain integer variant IDs
+    line_items = []
+    for item in order_data.get("line_items", []):
+        vid = str(item["variant_id"])
+        numeric_id = int(vid.split("/")[-1]) if "/" in vid else int(vid)
+        line_items.append({"variant_id": numeric_id, "quantity": item.get("quantity", 1)})
+
+    customer = order_data["customer"]
+    shipping = order_data["shipping_address"]
+    address = {
+        "first_name": customer["first_name"],
+        "last_name": customer["last_name"],
+        "phone": customer.get("phone", ""),
+        **shipping,
+    }
+
+    payload = {
+        "order": {
+            "line_items": line_items,
+            "customer": {
+                "first_name": customer["first_name"],
+                "last_name": customer["last_name"],
+                "email": customer.get("email", ""),
+            },
+            "shipping_address": address,
+            "billing_address": address,
+            "financial_status": "pending",
+            "tags": "cash-on-delivery,ai-agent",
+            "note": "Placed via AI shopping assistant. Payment: Cash on Delivery.",
+            "send_receipt": True,
+        }
+    }
+
+    with httpx.Client(timeout=15) as http:
+        resp = http.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _send_whatsapp_reply(to: str, reply_text: str, image_urls: list[str] | None = None) -> None:
     """Send a WhatsApp message via Twilio REST API (called from background task)."""
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    # Derive the Twilio sender number: swap the From/To from the inbound message
-    # `to` here is the original From (customer), sender is the Twilio number
     sender = os.getenv("TWILIO_WHATSAPP_FROM")  # e.g. "whatsapp:+12602691164"
-    twilio_client.messages.create(body=reply_text, from_=sender, to=to)
+
+    # Twilio supports up to 10 media URLs per message; cap at 10 to be safe
+    media = (image_urls or [])[:10] or None
+    twilio_client.messages.create(body=reply_text, from_=sender, to=to, media_url=media)
 
 
 def _run_agent_and_reply(session_id: str, user_message: str, phone_number: str) -> None:
@@ -335,15 +445,42 @@ def _run_agent_and_reply(session_id: str, user_message: str, phone_number: str) 
 
     raw_reply = "".join(parts)
 
-    # Strip the ```products ... ``` block — product cards are meaningless over WhatsApp
-    match = re.search(r"```products\s*\[.*?\]\s*```", raw_reply, re.DOTALL)
-    reply_text = raw_reply[: match.start()].rstrip() if match else raw_reply
+    image_urls: list[str] = []
+
+    # Order block — create Shopify order and build confirmation message
+    order_match = re.search(r"```order\s*(\{.*?\})\s*```", raw_reply, re.DOTALL)
+    if order_match:
+        preamble = raw_reply[:order_match.start()].rstrip()
+        try:
+            order_data = json.loads(order_match.group(1))
+            result = _create_shopify_order(order_data)
+            order_name = result["order"]["name"]
+            reply_text = f"{preamble}\n\n✅ Order {order_name} confirmed! We'll be in touch to arrange delivery. Payment is due on arrival — no card needed."
+        except Exception as exc:
+            print(f"[whatsapp] order creation error: {exc}")
+            reply_text = f"{preamble}\n\nSorry, we couldn't place your order right now. Please try again."
+    else:
+        # Products block — extract images then strip the JSON
+        prod_match = re.search(r"```products\s*(\[.*?\])\s*```", raw_reply, re.DOTALL)
+        if prod_match:
+            try:
+                products = json.loads(prod_match.group(1))
+                image_urls = [p["image_url"] for p in products if p.get("image_url")]
+            except (json.JSONDecodeError, KeyError):
+                pass
+            reply_text = raw_reply[:prod_match.start()].rstrip()
+        else:
+            reply_text = raw_reply
 
     # Truncate to WhatsApp's 1600-character limit
     if len(reply_text) > 1600:
         reply_text = reply_text[:1597] + "..."
 
-    _send_whatsapp_reply(phone_number, reply_text or "Sorry, I didn't get a response. Please try again.")
+    _send_whatsapp_reply(
+        phone_number,
+        reply_text or "Sorry, I didn't get a response. Please try again.",
+        image_urls=image_urls or None,
+    )
 
 
 @app.post("/whatsapp")
