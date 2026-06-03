@@ -1,0 +1,22 @@
+# Environment & secrets
+files/.env
+.env
+
+# Python
+files/venv/
+files/__pycache__/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+.idea/
