@@ -260,6 +260,29 @@
     color: #16a34a;
   }
 
+  /* ── Defective report confirmation card ── */
+  .ai-defect-reported {
+    background: #fffbeb;
+    border: 1.5px solid #fcd34d;
+    border-radius: 12px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 100%;
+  }
+  .ai-defect-reported__icon  { font-size: 20px; }
+  .ai-defect-reported__title {
+    font-weight: 700;
+    font-size: 14px;
+    color: #92400e;
+  }
+  .ai-defect-reported__note {
+    font-size: 12px;
+    color: #b45309;
+    margin-top: 2px;
+  }
+
   /* ── Product cards ── */
   .ai-product-grid {
     display: grid;
@@ -405,6 +428,28 @@
     messages.scrollTop = messages.scrollHeight;
   }
 
+  // ── Render defective report confirmation card ─────────────────────────────
+  function appendDefectReported(orderNumber) {
+    const card = document.createElement('div');
+    card.className = 'ai-defect-reported';
+
+    const icon = document.createElement('div');
+    icon.className = 'ai-defect-reported__icon';
+    icon.textContent = '📋';
+
+    const title = document.createElement('div');
+    title.className = 'ai-defect-reported__title';
+    title.textContent = 'Report submitted';
+
+    const note = document.createElement('div');
+    note.className = 'ai-defect-reported__note';
+    note.textContent = (orderNumber ? `Order ${orderNumber} — ` : '') + 'The store team has been notified and will follow up within 24 hours.';
+
+    card.append(icon, title, note);
+    messages.appendChild(card);
+    messages.scrollTop = messages.scrollHeight;
+  }
+
   // ── Render product image cards ────────────────────────────────────────────
   function appendProductCards(products) {
     if (!products || !products.length) return;
@@ -507,6 +552,9 @@
           } else if (event.type === 'order_confirmed') {
             typing.style.display = 'none';
             appendOrderConfirmed(event.order_number, event.order_name);
+          } else if (event.type === 'defect_reported') {
+            typing.style.display = 'none';
+            appendDefectReported(event.order_number);
           } else if (event.type === 'tool') {
             // Keep typing indicator visible while tool runs
             typing.style.display = 'flex';
@@ -514,7 +562,7 @@
             typing.style.display = 'none';
           } else if (event.type === 'error') {
             typing.style.display = 'none';
-            bubble.textContent = '⚠️ Something went wrong. Please try again.';
+            bubble.textContent = '⚠️ ' + (event.message || 'Something went wrong. Please try again.');
           }
         }
       }

@@ -25,6 +25,8 @@ SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN")    # Admin API token for 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+STORE_OWNER_EMAIL = os.getenv("STORE_OWNER_EMAIL")
 
 if not ANTHROPIC_API_KEY:
     raise RuntimeError("ANTHROPIC_API_KEY is not set in .env")
@@ -54,15 +56,25 @@ Your job is to help customers:
 
 Always be concise and helpful. Store domain: {SHOPIFY_STORE_DOMAIN}
 
+## What this store sells
+
+This store carries three product categories:
+- **Tech / electronics:** headphones, keyboards, cables, speakers, mice, monitors, laptop stands, SSDs, webcams, charging pads, chargers, laptop sleeves
+- **Socks:** ankle socks, wool hiking socks, compression socks, bamboo crew socks, novelty socks
+- **Meat / braai:** beef steak, chicken breast, boerewors, lamb chops, pork ribs
+
+Never tell a customer the store only sells tech — it also sells socks and meat.
+
 ## Search strategy
 
 Always call search_catalog with pagination.limit set to 25 or less — never omit the limit or set it above 25.
 
-Use this two-step approach:
-1. Search with the customer's specific keywords first (e.g. "charger", "sleeve", "sock").
-2. If that returns 0 products, do a fallback search using the query "tech" with limit 25 — this reliably returns the full catalog for this store. Then filter the results by hand to find the best match.
+Use this approach:
+1. Search with the customer's specific keywords first (e.g. "charger", "sock", "steak", "ribs").
+2. If that returns 0 products, try the category name as the query: "meat", "socks", or "tech" depending on what the customer is asking about.
+3. If still 0 results, try a broader term ("braai", "accessories", "clothing") as a last resort.
 
-Never tell a customer a product doesn't exist based on a single failed search. Always try the fallback before concluding something is out of stock.
+Never tell a customer a product doesn't exist based on a single failed search. Try at least two searches before concluding something is unavailable.
 
 ## Product cards
 
@@ -130,6 +142,28 @@ Rules:
 - Only output the order block once the customer has explicitly confirmed.
 - Never ask for payment details — it is always Cash on Delivery.
 - Keep the tone friendly and conversational throughout — this should feel like chatting with a helpful person, not filling in a form.
+
+## Defective or damaged orders
+
+If a customer reports receiving a defective, damaged, or wrong item:
+1. Apologise sincerely and empathetically.
+2. Ask for their order number and a brief description of the problem (if they haven't already provided both).
+3. Once you have both, say something like "I'm logging this with the store team now." — do NOT claim the team has been notified or that an email has been sent, because the system confirms that separately.
+4. Output this block at the very end of your message and nothing after it:
+
+```defective_report
+{{
+  "customer_name": "...",
+  "order_number": "...",
+  "issue": "...",
+  "contact": "..."
+}}
+```
+
+Rules:
+- customer_name and contact are whatever the customer shared (name, phone, email — whatever is available).
+- issue is a short description of the problem in the customer's own words.
+- Only output the block once you have both the order number and a description of the issue.
 """
 
 # ── Lifespan: create agent + environment once on startup ──────────────────────
@@ -328,6 +362,26 @@ async def chat(session_id: str, body: ChatRequest):
                             yield f"data: {json.dumps({'type': 'error', 'message': f'Could not place order: {exc}'})}\n\n"
                         continue
 
+                    # Defective report block — send email to store owner
+                    defect_match = re.search(r"```defective_report\s*(\{.*?\})\s*```", text, re.DOTALL)
+                    if defect_match:
+                        clean_text = text[:defect_match.start()].rstrip()
+                        if clean_text:
+                            yield f"data: {json.dumps({'type': 'text', 'content': clean_text})}\n\n"
+                        sent = False
+                        order_number = None
+                        try:
+                            report = json.loads(defect_match.group(1))
+                            order_number = report.get("order_number")
+                            sent = await loop.run_in_executor(executor, lambda: _send_defect_email(report))
+                        except Exception as exc:
+                            print(f"[email] Failed to parse/send defect report: {exc}")
+                        if sent:
+                            yield f"data: {json.dumps({'type': 'defect_reported', 'order_number': order_number})}\n\n"
+                        else:
+                            yield f"data: {json.dumps({'type': 'error', 'message': 'We could not submit your report right now. Please contact us directly or try again shortly.'})}\n\n"
+                        continue
+
                     # Products block — emit product cards
                     prod_match = re.search(r"```products\s*(\[.*?\])\s*```", text, re.DOTALL)
                     if prod_match:
@@ -406,6 +460,40 @@ def _create_shopify_order(order_data: dict) -> dict:
         return resp.json()
 
 
+def _send_defect_email(report: dict) -> bool:
+    """Send a defective order notification to the store owner via Resend.
+    Returns True on success, False on any failure."""
+    if not RESEND_API_KEY or not STORE_OWNER_EMAIL:
+        print("[email] RESEND_API_KEY or STORE_OWNER_EMAIL not set — skipping email")
+        return False
+    html = (
+        f"<h2>⚠️ Defective Order Report</h2>"
+        f"<p><strong>Customer:</strong> {report.get('customer_name', 'Unknown')}</p>"
+        f"<p><strong>Order number:</strong> {report.get('order_number', 'Not provided')}</p>"
+        f"<p><strong>Issue:</strong> {report.get('issue', 'No description')}</p>"
+        f"<p><strong>Contact:</strong> {report.get('contact', 'Not provided')}</p>"
+    )
+    payload = {
+        "from": "onboarding@resend.dev",
+        "to": [STORE_OWNER_EMAIL],
+        "subject": f"⚠️ Defective order report — {report.get('order_number', 'unknown')}",
+        "html": html,
+    }
+    try:
+        with httpx.Client(timeout=10) as http:
+            resp = http.post(
+                "https://api.resend.com/emails",
+                json=payload,
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            )
+            resp.raise_for_status()
+            print(f"[email] Defect report sent for order {report.get('order_number')}")
+            return True
+    except Exception as exc:
+        print(f"[email] Failed to send defect report: {exc}")
+        return False
+
+
 def _send_whatsapp_reply(to: str, reply_text: str, image_urls: list[str] | None = None) -> None:
     """Send a WhatsApp message via Twilio REST API (called from background task)."""
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -460,17 +548,32 @@ def _run_agent_and_reply(session_id: str, user_message: str, phone_number: str) 
             print(f"[whatsapp] order creation error: {exc}")
             reply_text = f"{preamble}\n\nSorry, we couldn't place your order right now. Please try again."
     else:
-        # Products block — extract images then strip the JSON
-        prod_match = re.search(r"```products\s*(\[.*?\])\s*```", raw_reply, re.DOTALL)
-        if prod_match:
+        # Defective report block — send email, build reply based on actual result
+        defect_match = re.search(r"```defective_report\s*(\{.*?\})\s*```", raw_reply, re.DOTALL)
+        if defect_match:
+            preamble = raw_reply[:defect_match.start()].rstrip()
+            sent = False
             try:
-                products = json.loads(prod_match.group(1))
-                image_urls = [p["image_url"] for p in products if p.get("image_url")]
-            except (json.JSONDecodeError, KeyError):
-                pass
-            reply_text = raw_reply[:prod_match.start()].rstrip()
+                report = json.loads(defect_match.group(1))
+                sent = _send_defect_email(report)
+            except Exception as exc:
+                print(f"[whatsapp] defect report error: {exc}")
+            if sent:
+                reply_text = f"{preamble}\n\n✅ Your report has been submitted. The store team will follow up with you within 24 hours."
+            else:
+                reply_text = f"{preamble}\n\n⚠️ Sorry, we couldn't submit your report right now. Please contact us directly and we'll sort this out immediately."
         else:
-            reply_text = raw_reply
+            # Products block — extract images then strip the JSON
+            prod_match = re.search(r"```products\s*(\[.*?\])\s*```", raw_reply, re.DOTALL)
+            if prod_match:
+                try:
+                    products = json.loads(prod_match.group(1))
+                    image_urls = [p["image_url"] for p in products if p.get("image_url")]
+                except (json.JSONDecodeError, KeyError):
+                    pass
+                reply_text = raw_reply[:prod_match.start()].rstrip()
+            else:
+                reply_text = raw_reply
 
     # Truncate to WhatsApp's 1600-character limit
     if len(reply_text) > 1600:
