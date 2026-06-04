@@ -154,27 +154,94 @@ Rules:
 - Never ask for payment details — it is always Cash on Delivery.
 - Keep the tone friendly and conversational throughout — this should feel like chatting with a helpful person, not filling in a form.
 
-## Defective or damaged orders
+## Post-purchase support flows
+
+For ALL support requests below, always collect: order number, customer name, email address, and phone number (if not already provided). Email is required so we can send the customer a confirmation and follow up. Collect missing details before outputting any block.
+
+Once you have what you need, say something like "I'm logging this with the store team now." — do NOT claim an email has been sent, because the system handles that separately.
+
+---
+
+### Defective or damaged product
 
 If a customer reports receiving a defective, damaged, or wrong item:
 1. Apologise sincerely and empathetically.
-2. Ask for their order number and a brief description of the problem (if they haven't already provided both).
-3. Once you have both, say something like "I'm logging this with the store team now." — do NOT claim the team has been notified or that an email has been sent, because the system confirms that separately.
-4. Output this block at the very end of your message and nothing after it:
+2. Collect: order number, description of the problem, email address, phone.
+3. Output this block at the very end of your message and nothing after it:
 
 ```defective_report
 {{
   "customer_name": "...",
   "order_number": "...",
   "issue": "...",
-  "contact": "..."
+  "contact_email": "...",
+  "contact_phone": "..."
 }}
 ```
 
-Rules:
-- customer_name and contact are whatever the customer shared (name, phone, email — whatever is available).
-- issue is a short description of the problem in the customer's own words.
-- Only output the block once you have both the order number and a description of the issue.
+---
+
+### Change delivery address
+
+If a customer wants to change where their order is being delivered:
+1. Confirm you'll do your best to update it before dispatch.
+2. Collect: order number, full new delivery address (street, city, postal code), email, phone.
+3. Output this block at the very end of your message and nothing after it:
+
+```address_change_request
+{{
+  "customer_name": "...",
+  "order_number": "...",
+  "new_address": "...",
+  "contact_email": "...",
+  "contact_phone": "..."
+}}
+```
+
+---
+
+### Change delivery date
+
+If a customer wants to change when their order is delivered:
+1. Acknowledge the request warmly.
+2. Collect: order number, preferred delivery date or time window, email, phone.
+3. Output this block at the very end of your message and nothing after it:
+
+```date_change_request
+{{
+  "customer_name": "...",
+  "order_number": "...",
+  "preferred_date": "...",
+  "contact_email": "...",
+  "contact_phone": "..."
+}}
+```
+
+---
+
+### Order error (wrong/missing item)
+
+If a customer received the wrong item, is missing items, or has any other order fulfilment error:
+1. Apologise and take it seriously.
+2. Collect: order number, description of the error (what they got vs what they ordered), email, phone.
+3. Output this block at the very end of your message and nothing after it:
+
+```order_error_report
+{{
+  "customer_name": "...",
+  "order_number": "...",
+  "issue": "...",
+  "contact_email": "...",
+  "contact_phone": "..."
+}}
+```
+
+---
+
+Rules for all support blocks:
+- Only output the block once you have ALL required fields including email.
+- Never fabricate order numbers or contact details.
+- Keep the tone warm and reassuring throughout.
 """
 
 # ── Lifespan: create agent + environment once on startup ──────────────────────
@@ -203,7 +270,7 @@ async def lifespan(app: FastAPI):
 
         agent = client.beta.agents.create(
             name="Shopify Shopping Assistant",
-            model={"id": "claude-haiku-4-5-20251001"},
+            model={"id": "claude-sonnet-4-6"},
             system=SYSTEM_PROMPT,
             mcp_servers=[
                 {
@@ -373,24 +440,33 @@ async def chat(session_id: str, body: ChatRequest):
                             yield f"data: {json.dumps({'type': 'error', 'message': f'Could not place order: {exc}'})}\n\n"
                         continue
 
-                    # Defective report block — send email to store owner
-                    defect_match = re.search(r"```defective_report\s*(\{.*?\})\s*```", text, re.DOTALL)
-                    if defect_match:
-                        clean_text = text[:defect_match.start()].rstrip()
+                    # Support request blocks — email owner + customer confirmation
+                    support_match = re.search(
+                        r"```(defective_report|address_change_request|date_change_request|order_error_report)"
+                        r"\s*(\{.*?\})\s*```",
+                        text, re.DOTALL,
+                    )
+                    if support_match:
+                        report_type = support_match.group(1)
+                        clean_text = text[:support_match.start()].rstrip()
                         if clean_text:
                             yield f"data: {json.dumps({'type': 'text', 'content': clean_text})}\n\n"
                         sent = False
                         order_number = None
                         try:
-                            report = json.loads(defect_match.group(1))
+                            report = json.loads(support_match.group(2))
                             order_number = report.get("order_number")
-                            sent = await loop.run_in_executor(executor, lambda: _send_defect_email(report))
+                            _rtype = report_type
+                            _rep = report
+                            sent = await loop.run_in_executor(
+                                executor, lambda: _send_support_emails(_rtype, _rep)
+                            )
                         except Exception as exc:
-                            print(f"[email] Failed to parse/send defect report: {exc}")
+                            print(f"[email] Failed to parse/send {report_type}: {exc}")
                         if sent:
-                            yield f"data: {json.dumps({'type': 'defect_reported', 'order_number': order_number})}\n\n"
+                            yield f"data: {json.dumps({'type': 'support_submitted', 'report_type': report_type, 'order_number': order_number})}\n\n"
                         else:
-                            yield f"data: {json.dumps({'type': 'error', 'message': 'We could not submit your report right now. Please contact us directly or try again shortly.'})}\n\n"
+                            yield f"data: {json.dumps({'type': 'error', 'message': 'We could not submit your request right now. Please contact us directly or try again shortly.'})}\n\n"
                         continue
 
                     # Products block — emit product cards
@@ -471,38 +547,92 @@ def _create_shopify_order(order_data: dict) -> dict:
         return resp.json()
 
 
-def _send_defect_email(report: dict) -> bool:
-    """Send a defective order notification to the store owner via Resend.
-    Returns True on success, False on any failure."""
+_SUPPORT_LABELS = {
+    "defective_report":      ("⚠️ Defective Product Report",        "defective product report"),
+    "address_change_request": ("📦 Delivery Address Change Request", "delivery address change request"),
+    "date_change_request":    ("📅 Delivery Date Change Request",    "delivery date change request"),
+    "order_error_report":     ("❌ Order Error Report",              "order error report"),
+}
+
+
+def _send_support_emails(report_type: str, report: dict) -> bool:
+    """Send a support request to the store owner and a confirmation to the customer.
+    Returns True if the owner email succeeded, False otherwise."""
     if not RESEND_API_KEY or not STORE_OWNER_EMAIL:
-        print("[email] RESEND_API_KEY or STORE_OWNER_EMAIL not set — skipping email")
+        print("[email] RESEND_API_KEY or STORE_OWNER_EMAIL not set — skipping")
         return False
-    html = (
-        f"<h2>⚠️ Defective Order Report</h2>"
-        f"<p><strong>Customer:</strong> {report.get('customer_name', 'Unknown')}</p>"
-        f"<p><strong>Order number:</strong> {report.get('order_number', 'Not provided')}</p>"
-        f"<p><strong>Issue:</strong> {report.get('issue', 'No description')}</p>"
-        f"<p><strong>Contact:</strong> {report.get('contact', 'Not provided')}</p>"
+
+    subject_prefix, label = _SUPPORT_LABELS.get(report_type, ("⚠️ Support Request", "support request"))
+    order_number   = report.get("order_number", "Not provided")
+    customer_name  = report.get("customer_name", "Customer")
+    contact_email  = report.get("contact_email", "")
+    contact_phone  = report.get("contact_phone", "Not provided")
+
+    # Owner email — full details
+    owner_rows = "".join(
+        f"<tr><td style='padding:4px 8px;font-weight:bold;white-space:nowrap'>{k.replace('_', ' ').title()}</td>"
+        f"<td style='padding:4px 8px'>{v}</td></tr>"
+        for k, v in report.items()
     )
-    payload = {
-        "from": "onboarding@resend.dev",
-        "to": [STORE_OWNER_EMAIL],
-        "subject": f"⚠️ Defective order report — {report.get('order_number', 'unknown')}",
-        "html": html,
-    }
-    try:
-        with httpx.Client(timeout=10) as http:
+    owner_html = (
+        f"<h2>{subject_prefix}</h2>"
+        f"<table border='0' cellpadding='0' cellspacing='0'>{owner_rows}</table>"
+    )
+
+    success = False
+    with httpx.Client(timeout=10) as http:
+        try:
             resp = http.post(
                 "https://api.resend.com/emails",
-                json=payload,
+                json={
+                    "from": "onboarding@resend.dev",
+                    "to": [STORE_OWNER_EMAIL],
+                    "subject": f"{subject_prefix} — Order {order_number}",
+                    "html": owner_html,
+                },
                 headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
             )
             resp.raise_for_status()
-            print(f"[email] Defect report sent for order {report.get('order_number')}")
-            return True
-    except Exception as exc:
-        print(f"[email] Failed to send defect report: {exc}")
-        return False
+            print(f"[email] Owner notified for {report_type} on order {order_number}")
+            success = True
+        except Exception as exc:
+            print(f"[email] Failed to send owner notification: {exc}")
+
+        # Customer confirmation email (only if a valid email was collected)
+        if contact_email and "@" in contact_email:
+            # Build a human-readable summary of what was submitted
+            skip_keys = {"contact_email", "customer_name"}
+            summary_rows = "".join(
+                f"<tr><td style='padding:4px 8px;font-weight:bold;white-space:nowrap'>{k.replace('_', ' ').title()}</td>"
+                f"<td style='padding:4px 8px'>{v}</td></tr>"
+                for k, v in report.items() if k not in skip_keys
+            )
+            customer_html = (
+                f"<p>Hi {customer_name},</p>"
+                f"<p>Thanks for getting in touch. We've received your <strong>{label}</strong> "
+                f"and our team will be in touch within 24 hours.</p>"
+                f"<h3>Your submission:</h3>"
+                f"<table border='0' cellpadding='0' cellspacing='0'>{summary_rows}</table>"
+                f"<br><p>If you have any questions in the meantime, just reply to this email.</p>"
+                f"<p>— Bob's Tech Shop Team</p>"
+            )
+            try:
+                resp = http.post(
+                    "https://api.resend.com/emails",
+                    json={
+                        "from": "onboarding@resend.dev",
+                        "to": [contact_email],
+                        "subject": f"We've received your request — Order {order_number}",
+                        "html": customer_html,
+                    },
+                    headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+                )
+                resp.raise_for_status()
+                print(f"[email] Customer confirmation sent to {contact_email}")
+            except Exception as exc:
+                print(f"[email] Failed to send customer confirmation: {exc}")
+
+    return success
 
 
 def _send_whatsapp_reply(to: str, reply_text: str, image_urls: list[str] | None = None) -> None:
@@ -586,20 +716,25 @@ def _run_agent_and_reply_inner(session_id: str, user_message: str, phone_number:
             print(f"[whatsapp] order creation error: {exc}")
             reply_text = f"{preamble}\n\nSorry, we couldn't place your order right now. Please try again."
     else:
-        # Defective report block — send email, build reply based on actual result
-        defect_match = re.search(r"```defective_report\s*(\{.*?\})\s*```", raw_reply, re.DOTALL)
-        if defect_match:
-            preamble = raw_reply[:defect_match.start()].rstrip()
+        # Support request blocks (defective report, address change, date change, order error)
+        support_match = re.search(
+            r"```(defective_report|address_change_request|date_change_request|order_error_report)"
+            r"\s*(\{.*?\})\s*```",
+            raw_reply, re.DOTALL,
+        )
+        if support_match:
+            report_type = support_match.group(1)
+            preamble = raw_reply[:support_match.start()].rstrip()
             sent = False
             try:
-                report = json.loads(defect_match.group(1))
-                sent = _send_defect_email(report)
+                report = json.loads(support_match.group(2))
+                sent = _send_support_emails(report_type, report)
             except Exception as exc:
-                print(f"[whatsapp] defect report error: {exc}")
+                print(f"[whatsapp] {report_type} error: {exc}")
             if sent:
-                reply_text = f"{preamble}\n\n✅ Your report has been submitted. The store team will follow up with you within 24 hours."
+                reply_text = f"{preamble}\n\n✅ Your request has been submitted and a confirmation has been sent to your email. The store team will follow up within 24 hours."
             else:
-                reply_text = f"{preamble}\n\n⚠️ Sorry, we couldn't submit your report right now. Please contact us directly and we'll sort this out immediately."
+                reply_text = f"{preamble}\n\n⚠️ Sorry, we couldn't submit your request right now. Please contact us directly and we'll sort this out immediately."
         else:
             # Products block — extract images then strip the JSON
             prod_match = re.search(r"```products\s*(\[.*?\])\s*```", raw_reply, re.DOTALL)
