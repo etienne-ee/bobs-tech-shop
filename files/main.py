@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import re
+import threading
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 
@@ -39,6 +40,16 @@ executor = ThreadPoolExecutor(max_workers=20)
 # WhatsApp session store: maps WhatsApp phone number → Managed Agent session ID
 # In-memory only — resets on server restart. Swap for Redis/DB in production.
 whatsapp_sessions: dict[str, str] = {}
+
+# Per-number lock: prevents concurrent agent calls for the same WhatsApp number.
+_whatsapp_locks: dict[str, threading.Lock] = {}
+_whatsapp_locks_guard = threading.Lock()
+
+def _get_whatsapp_lock(phone_number: str) -> threading.Lock:
+    with _whatsapp_locks_guard:
+        if phone_number not in _whatsapp_locks:
+            _whatsapp_locks[phone_number] = threading.Lock()
+        return _whatsapp_locks[phone_number]
 
 ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
 
@@ -506,7 +517,20 @@ def _send_whatsapp_reply(to: str, reply_text: str, image_urls: list[str] | None 
 
 def _run_agent_and_reply(session_id: str, user_message: str, phone_number: str) -> None:
     """Run in thread executor: get agent reply, then push it via Twilio REST API."""
-    parts: list[str] = []
+    lock = _get_whatsapp_lock(phone_number)
+    if not lock.acquire(blocking=False):
+        # Another message from this number is already being processed — drop to avoid flooding.
+        print(f"[whatsapp] dropping concurrent message from {phone_number}")
+        return
+    try:
+        _run_agent_and_reply_inner(session_id, user_message, phone_number)
+    finally:
+        lock.release()
+
+
+def _run_agent_and_reply_inner(session_id: str, user_message: str, phone_number: str) -> None:
+    last_text = ""
+    rate_limited = False
     try:
         with client.beta.sessions.events.stream(session_id) as stream:
             client.beta.sessions.events.send(
@@ -523,15 +547,29 @@ def _run_agent_and_reply(session_id: str, user_message: str, phone_number: str) 
                     for block in event.content:
                         text = getattr(block, "text", None)
                         if text:
-                            parts.append(text)
+                            last_text = text  # overwrite — only the final reply matters
+                elif event.type == "session.error":
+                    err = getattr(event, "error", None)
+                    if err and getattr(err, "type", None) == "model_rate_limited_error":
+                        rate_limited = True
                 elif event.type == "session.status_idle":
+                    stop = getattr(event, "stop_reason", None)
+                    if stop and getattr(stop, "type", None) == "retries_exhausted":
+                        rate_limited = True
                     break
     except Exception as exc:
         print(f"[whatsapp] agent error: {exc}")
         _send_whatsapp_reply(phone_number, "Sorry, something went wrong. Please try again.")
         return
 
-    raw_reply = "".join(parts)
+    if rate_limited or not last_text:
+        _send_whatsapp_reply(
+            phone_number,
+            "I'm a bit busy right now — please send your message again in a moment.",
+        )
+        return
+
+    raw_reply = last_text
 
     image_urls: list[str] = []
 
