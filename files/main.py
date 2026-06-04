@@ -3,6 +3,11 @@ import json
 import asyncio
 import re
 import threading
+import smtplib
+import ssl
+import certifi
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 
@@ -26,8 +31,9 @@ SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN")    # Admin API token for 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 STORE_OWNER_EMAIL = os.getenv("STORE_OWNER_EMAIL")
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
 
 if not ANTHROPIC_API_KEY:
     raise RuntimeError("ANTHROPIC_API_KEY is not set in .env")
@@ -555,20 +561,42 @@ _SUPPORT_LABELS = {
 }
 
 
+def _smtp_send(to: str, subject: str, html: str) -> bool:
+    """Send a single email via Gmail/Workspace SMTP. Returns True on success."""
+    if not SMTP_USER or not SMTP_APP_PASSWORD:
+        print("[email] SMTP_USER or SMTP_APP_PASSWORD not set — skipping")
+        return False
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = to
+    msg.attach(MIMEText(html, "html"))
+    try:
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.ehlo()
+            server.starttls(context=ctx)
+            server.login(SMTP_USER, SMTP_APP_PASSWORD)
+            server.sendmail(SMTP_USER, to, msg.as_string())
+        return True
+    except Exception as exc:
+        print(f"[email] SMTP error: {exc}")
+        return False
+
+
 def _send_support_emails(report_type: str, report: dict) -> bool:
-    """Send a support request to the store owner and a confirmation to the customer.
-    Returns True if the owner email succeeded, False otherwise."""
-    if not RESEND_API_KEY or not STORE_OWNER_EMAIL:
-        print("[email] RESEND_API_KEY or STORE_OWNER_EMAIL not set — skipping")
+    """Email the store owner (full details) and the customer (confirmation).
+    Returns True if the owner email succeeded."""
+    if not STORE_OWNER_EMAIL:
+        print("[email] STORE_OWNER_EMAIL not set — skipping")
         return False
 
     subject_prefix, label = _SUPPORT_LABELS.get(report_type, ("⚠️ Support Request", "support request"))
-    order_number   = report.get("order_number", "Not provided")
-    customer_name  = report.get("customer_name", "Customer")
-    contact_email  = report.get("contact_email", "")
-    contact_phone  = report.get("contact_phone", "Not provided")
+    order_number  = report.get("order_number", "Not provided")
+    customer_name = report.get("customer_name", "Customer")
+    contact_email = report.get("contact_email", "")
 
-    # Owner email — full details
+    # Owner email — full details table
     owner_rows = "".join(
         f"<tr><td style='padding:4px 8px;font-weight:bold;white-space:nowrap'>{k.replace('_', ' ').title()}</td>"
         f"<td style='padding:4px 8px'>{v}</td></tr>"
@@ -578,59 +606,34 @@ def _send_support_emails(report_type: str, report: dict) -> bool:
         f"<h2>{subject_prefix}</h2>"
         f"<table border='0' cellpadding='0' cellspacing='0'>{owner_rows}</table>"
     )
+    success = _smtp_send(STORE_OWNER_EMAIL, f"{subject_prefix} — Order {order_number}", owner_html)
+    if success:
+        print(f"[email] Owner notified for {report_type} on order {order_number}")
+    else:
+        print(f"[email] Failed to notify owner for {report_type}")
 
-    success = False
-    with httpx.Client(timeout=10) as http:
-        try:
-            resp = http.post(
-                "https://api.resend.com/emails",
-                json={
-                    "from": "onboarding@resend.dev",
-                    "to": [STORE_OWNER_EMAIL],
-                    "subject": f"{subject_prefix} — Order {order_number}",
-                    "html": owner_html,
-                },
-                headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-            )
-            resp.raise_for_status()
-            print(f"[email] Owner notified for {report_type} on order {order_number}")
-            success = True
-        except Exception as exc:
-            print(f"[email] Failed to send owner notification: {exc}")
-
-        # Customer confirmation email (only if a valid email was collected)
-        if contact_email and "@" in contact_email:
-            # Build a human-readable summary of what was submitted
-            skip_keys = {"contact_email", "customer_name"}
-            summary_rows = "".join(
-                f"<tr><td style='padding:4px 8px;font-weight:bold;white-space:nowrap'>{k.replace('_', ' ').title()}</td>"
-                f"<td style='padding:4px 8px'>{v}</td></tr>"
-                for k, v in report.items() if k not in skip_keys
-            )
-            customer_html = (
-                f"<p>Hi {customer_name},</p>"
-                f"<p>Thanks for getting in touch. We've received your <strong>{label}</strong> "
-                f"and our team will be in touch within 24 hours.</p>"
-                f"<h3>Your submission:</h3>"
-                f"<table border='0' cellpadding='0' cellspacing='0'>{summary_rows}</table>"
-                f"<br><p>If you have any questions in the meantime, just reply to this email.</p>"
-                f"<p>— Bob's Tech Shop Team</p>"
-            )
-            try:
-                resp = http.post(
-                    "https://api.resend.com/emails",
-                    json={
-                        "from": "onboarding@resend.dev",
-                        "to": [contact_email],
-                        "subject": f"We've received your request — Order {order_number}",
-                        "html": customer_html,
-                    },
-                    headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-                )
-                resp.raise_for_status()
-                print(f"[email] Customer confirmation sent to {contact_email}")
-            except Exception as exc:
-                print(f"[email] Failed to send customer confirmation: {exc}")
+    # Customer confirmation — only if a valid email was collected
+    if contact_email and "@" in contact_email:
+        skip_keys = {"contact_email", "customer_name"}
+        summary_rows = "".join(
+            f"<tr><td style='padding:4px 8px;font-weight:bold;white-space:nowrap'>{k.replace('_', ' ').title()}</td>"
+            f"<td style='padding:4px 8px'>{v}</td></tr>"
+            for k, v in report.items() if k not in skip_keys
+        )
+        customer_html = (
+            f"<p>Hi {customer_name},</p>"
+            f"<p>Thanks for getting in touch. We've received your <strong>{label}</strong> "
+            f"and our team will be in touch within 24 hours.</p>"
+            f"<h3>Your submission:</h3>"
+            f"<table border='0' cellpadding='0' cellspacing='0'>{summary_rows}</table>"
+            f"<br><p>If you have any questions in the meantime, just reply to this email.</p>"
+            f"<p>— Bob's Tech Shop Team</p>"
+        )
+        sent = _smtp_send(contact_email, f"We've received your request — Order {order_number}", customer_html)
+        if sent:
+            print(f"[email] Customer confirmation sent to {contact_email}")
+        else:
+            print(f"[email] Failed to send customer confirmation to {contact_email}")
 
     return success
 
