@@ -24,3 +24,7 @@ __pycache__/
 # Local-only docs
 SERVER_SETUP.md
 CLAUDE.md
+ISSUES_LOG.md
+
+# Local experiment artifacts
+files/search_experiment_log.json
