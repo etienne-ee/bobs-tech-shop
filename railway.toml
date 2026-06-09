@@ -1,6 +1,5 @@
 [build]
 builder = "nixpacks"
-installCommand = "pip install -r files/requirements.txt"
 
 [deploy]
 startCommand = "uvicorn files.main:app --host 0.0.0.0 --port $PORT"
