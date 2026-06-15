@@ -3,11 +3,6 @@ import json
 import asyncio
 import re
 import threading
-import smtplib
-import ssl
-import certifi
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 
@@ -32,8 +27,8 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 STORE_OWNER_EMAIL = os.getenv("STORE_OWNER_EMAIL")
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+RESEND_FROM = os.getenv("RESEND_FROM", "Bob's Tech Shop <orders@bobstechshop.co.za>")
 
 if not ANTHROPIC_API_KEY:
     raise RuntimeError("ANTHROPIC_API_KEY is not set in .env")
@@ -72,6 +67,8 @@ Your job is to help customers:
 - Answer questions about store policies, shipping, and returns
 
 Always be concise and helpful. Store domain: {SHOPIFY_STORE_DOMAIN}
+
+Do not use markdown formatting — no **bold**, no bullet points, no headers. Write in plain conversational text.
 
 ## What this store sells
 
@@ -286,7 +283,6 @@ async def lifespan(app: FastAPI):
                 }
             ],
             tools=[
-                {"type": "agent_toolset_20260401"},
                 {
                     "type": "mcp_toolset",
                     "mcp_server_name": "shopify_storefront",
@@ -562,25 +558,21 @@ _SUPPORT_LABELS = {
 
 
 def _smtp_send(to: str, subject: str, html: str) -> bool:
-    """Send a single email via Gmail/Workspace SMTP. Returns True on success."""
-    if not SMTP_USER or not SMTP_APP_PASSWORD:
-        print("[email] SMTP_USER or SMTP_APP_PASSWORD not set — skipping")
+    """Send a single email via Resend REST API. Returns True on success."""
+    if not RESEND_API_KEY:
+        print("[email] RESEND_API_KEY not set — skipping")
         return False
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = to
-    msg.attach(MIMEText(html, "html"))
     try:
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls(context=ctx)
-            server.login(SMTP_USER, SMTP_APP_PASSWORD)
-            server.sendmail(SMTP_USER, to, msg.as_string())
+        resp = httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={"from": RESEND_FROM, "to": [to], "subject": subject, "html": html},
+            timeout=10,
+        )
+        resp.raise_for_status()
         return True
     except Exception as exc:
-        print(f"[email] SMTP error: {exc}")
+        print(f"[email] Resend error: {exc}")
         return False
 
 
